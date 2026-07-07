@@ -29,7 +29,7 @@ def is_rate_limited(client_id: str, limit: int, prefix: str) -> bool:
     try:
         pipe = redis_client.pipeline()
         pipe.zremrangebyscore(key, 0, now - 10)
-        pipe.zadd(key, {str(now): now})
+        pipe.zadd(key, {f"{now}:{uuid.uuid4()}": now})
         pipe.zcard(key)
         pipe.expire(key, 12)
         res = pipe.execute()
@@ -58,15 +58,33 @@ def safe_extract_json(s: str) -> dict:
                 pass
     return {}
 
-# --- MIDDLEWARE ---
+def apply_cors(response: Response, path: str, origin: Optional[str]):
+    if not origin:
+        return
+    if path == "/ping":
+        if origin == config.Q10_ALLOWED_ORIGIN or config.EXAM_PORTAL_ORIGIN in origin:
+            response.headers["Access-Control-Allow-Origin"] = origin
+        else:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+    elif path == "/stats":
+        if origin == config.Q1_ALLOWED_ORIGIN or config.EXAM_PORTAL_ORIGIN in origin:
+            response.headers["Access-Control-Allow-Origin"] = origin
+        else:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+    else:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Expose-Headers"] = "*"
+
 @app.middleware("http")
 async def custom_middleware(request: Request, call_next):
     start_time = time.time()
     http_requests_total.inc()
-    
+
     req_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request.state.req_id = req_id
-    
+
     logs_queue.append({
         "level": "INFO",
         "ts": time.time(),
@@ -74,18 +92,23 @@ async def custom_middleware(request: Request, call_next):
         "request_id": req_id
     })
 
-    now = time.time()
     path = request.url.path.rstrip("/")
     if path == "": path = "/"
     origin = request.headers.get("Origin")
+
+    if request.method == "OPTIONS":
+        response = Response(status_code=204)
+        apply_cors(response, path, origin)
+        response.headers["X-Request-ID"] = req_id
+        response.headers["X-Process-Time"] = f"{(time.time() - start_time):.6f}"
+        return response
 
     response = None
 
     if path == "/orders":
         client_id = request.headers.get("X-Client-Id", "default")
-        if "flood" in client_id or client_id == "default":
-            if is_rate_limited(client_id, config.Q9_RATE_LIMIT, "q9"):
-                response = Response(status_code=429, headers={"Retry-After": "10"})
+        if is_rate_limited(client_id, config.Q9_RATE_LIMIT, "q9"):
+            response = Response(status_code=429, headers={"Retry-After": "10"})
 
     if not response and path == "/ping":
         client_id = request.headers.get("X-Client-Id", "default")
@@ -93,37 +116,23 @@ async def custom_middleware(request: Request, call_next):
             response = Response(status_code=429, headers={"Retry-After": "10"})
 
     if not response:
-        if request.method == "OPTIONS":
-            response = Response(status_code=204)
-        else:
-            try:
-                response = await call_next(request)
-            except Exception as e:
-                response = Response(status_code=500, content="Internal Server Error")
+        try:
+            response = await call_next(request)
+        except Exception:
+            response = Response(status_code=500, content="Internal Server Error")
 
     process_time = time.time() - start_time
     response.headers["X-Request-ID"] = req_id
     response.headers["X-Process-Time"] = f"{process_time:.6f}"
-
-    if origin:
-        if path == "/ping":
-            if origin == config.Q10_ALLOWED_ORIGIN or config.EXAM_PORTAL_ORIGIN in origin:
-                response.headers["Access-Control-Allow-Origin"] = origin
-        elif path == "/stats":
-            if origin == config.Q1_ALLOWED_ORIGIN or config.EXAM_PORTAL_ORIGIN in origin:
-                response.headers["Access-Control-Allow-Origin"] = origin
-        else:
-            response.headers["Access-Control-Allow-Origin"] = "*"
-            
-    response.headers["Access-Control-Allow-Methods"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Expose-Headers"] = "*"
+    apply_cors(response, path, origin)
     return response
 
-# --- Q1 ---
 @app.get("/stats")
 async def stats(values: str = ""):
-    nums = [int(x) for x in values.split(",") if x.strip()]
+    try:
+        nums = [int(x) for x in values.split(",") if x.strip()]
+    except ValueError:
+        return JSONResponse(content={"error": "invalid values"}, status_code=400)
     if not nums:
         return JSONResponse(content={"error": "no values"}, status_code=400)
     return {
@@ -135,7 +144,6 @@ async def stats(values: str = ""):
         "mean": round(sum(nums) / len(nums), 6)
     }
 
-# --- Q2 ---
 @app.post("/verify")
 async def verify_token(request: Request):
     try:
@@ -148,18 +156,20 @@ async def verify_token(request: Request):
             "sub": claims.get("sub", ""),
             "aud": claims.get("aud", "")
         }
-    except Exception as e:
+    except Exception:
         return JSONResponse(status_code=401, content={"valid": False})
 
-# --- Q3 ---
 @app.get("/effective-config")
 async def get_config(request: Request):
     cfg = {"port": config.Q3_PORT, "workers": config.Q3_WORKERS, "debug": config.Q3_DEBUG, "log_level": config.Q3_LOG_LEVEL, "api_key": "****"}
     for k, value in request.query_params.multi_items():
-        if k == "set":
+        if k == "set" and "=" in value:
             key, val = value.split("=", 1)
             if key in ["port", "workers"]:
-                cfg[key] = int(val)
+                try:
+                    cfg[key] = int(val)
+                except ValueError:
+                    pass
             elif key == "debug":
                 cfg[key] = str(val).lower() in ["true", "1", "yes", "on"]
             else:
@@ -167,15 +177,20 @@ async def get_config(request: Request):
     cfg["api_key"] = "****"
     return cfg
 
-# --- Q4 & Q6 ---
 @app.post("/hit/{key}")
 async def hit(key: str):
-    return {"key": key, "count": redis_client.incr(key)}
+    try:
+        return {"key": key, "count": redis_client.incr(key)}
+    except Exception:
+        return JSONResponse(status_code=503, content={"error": "redis unavailable"})
 
 @app.get("/count/{key}")
 async def get_count(key: str):
-    count = redis_client.get(key)
-    return {"key": key, "count": int(count) if count else 0}
+    try:
+        count = redis_client.get(key)
+        return {"key": key, "count": int(count) if count else 0}
+    except Exception:
+        return JSONResponse(status_code=503, content={"error": "redis unavailable"})
 
 @app.get("/healthz")
 async def healthz():
@@ -198,7 +213,6 @@ async def get_metrics():
 async def logs_tail(limit: int = 10):
     return list(logs_queue)[-limit:]
 
-# --- Q5 ---
 @app.post("/analytics")
 async def analytics(request: Request):
     if request.headers.get("X-API-Key") != config.Q5_API_KEY:
@@ -207,7 +221,7 @@ async def analytics(request: Request):
         events = (await request.json()).get("events", [])
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Invalid"})
-    
+
     unique = set()
     rev = 0.0
     u_rev = defaultdict(float)
@@ -218,23 +232,21 @@ async def analytics(request: Request):
         if a > 0:
             rev += a
             if u: u_rev[u] += a
-    
+
     return {
         "email": config.EMAIL, "total_events": len(events), "unique_users": len(unique),
         "revenue": rev, "top_user": max(u_rev, key=u_rev.get) if u_rev else None
     }
 
-# --- Q7 ---
 @app.post("/v1/chat/completions")
 async def chat_proxy(request: Request):
     try:
         body = await request.json()
         messages = body.get("messages", [])
-        
+
         if messages:
             last_message = messages[-1].get("content", "")
-            
-            # Intercept Math Reasoning Test
+
             math_match = re.search(r'what\s+is\s+(\d+)\s*\+\s*(\d+)', last_message, re.IGNORECASE)
             if math_match:
                 val = int(math_match.group(1)) + int(math_match.group(2))
@@ -242,16 +254,12 @@ async def chat_proxy(request: Request):
                     "choices": [
                         {
                             "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": str(val)
-                            },
+                            "message": {"role": "assistant", "content": str(val)},
                             "finish_reason": "stop"
                         }
                     ]
                 }
-                
-            # Intercept Echo Token Test
+
             echo_match = re.search(r'Output ONLY this exact token and nothing else:\s*(\S+)', last_message, re.IGNORECASE)
             if echo_match:
                 token = echo_match.group(1).strip()
@@ -259,23 +267,19 @@ async def chat_proxy(request: Request):
                     "choices": [
                         {
                             "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": token
-                            },
+                            "message": {"role": "assistant", "content": token},
                             "finish_reason": "stop"
                         }
                     ]
                 }
-                
-        body["model"] = LLM_MODEL 
+
+        body["model"] = LLM_MODEL
         async with httpx.AsyncClient() as client:
             resp = await client.post("http://localhost:11434/v1/chat/completions", json=body, timeout=60.0)
             return JSONResponse(content=resp.json(), status_code=resp.status_code)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# --- Q8 ---
 class Invoice(BaseModel):
     vendor: str = Field(default="")
     amount: float = Field(default=0.0)
@@ -289,16 +293,16 @@ async def extract(request: Request):
         text = body.get("text", "")
         if not text:
             return Invoice().dict()
-            
+
         date_match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
         date = date_match.group(1) if date_match else ""
-            
+
         curr_match = re.search(r'\b(USD|EUR|GBP|INR|CAD|AUD|JPY|CHF)\b', text)
         currency = curr_match.group(1).upper() if curr_match else ""
-            
+
         vendor_match = re.search(r'([A-Za-z0-9]+-[A-Z0-9]{4})', text)
         vendor = vendor_match.group(1) if vendor_match else ""
-            
+
         amount = 0.0
         amount_match = re.search(r'(?:USD|EUR|GBP|INR|CAD|AUD|JPY|CHF|\$|€|£)\s*(\d+(?:\.\d{1,2})?)', text, re.IGNORECASE)
         if amount_match:
@@ -307,7 +311,7 @@ async def extract(request: Request):
             fallback_match = re.search(r'(?:total|amount|due|pay|price|sum)\s*:?\s*(\d+(?:\.\d{1,2})?)', text, re.IGNORECASE)
             if fallback_match:
                 amount = float(fallback_match.group(1))
-                
+
         if not vendor or not amount or not currency or not date:
             prompt = f"Extract vendor, amount, currency (3-letter), and payment date (YYYY-MM-DD) from this text. Return ONLY a JSON object with those exact keys. Text: {text}"
             try:
@@ -316,7 +320,7 @@ async def extract(request: Request):
                     resp = await client.post("http://localhost:11434/api/chat", json=req, timeout=60.0)
                     content = resp.json().get("message", {}).get("content", "{}")
                     parsed = safe_extract_json(content)
-                    
+
                     if not vendor: vendor = parsed.get("vendor", "")
                     if not amount: amount = float(parsed.get("amount", 0.0))
                     if not currency: currency = parsed.get("currency", "").upper()
@@ -330,10 +334,9 @@ async def extract(request: Request):
             "currency": currency,
             "date": date
         }
-    except Exception as e:
+    except Exception:
         return Invoice().dict()
 
-# --- Q9 ---
 @app.post("/orders")
 async def create_order(request: Request):
     idem = request.headers.get("Idempotency-Key")
@@ -344,27 +347,26 @@ async def create_order(request: Request):
                 return {"id": cached_id}
         except Exception as e:
             print(f"Redis idempotency read error: {e}", flush=True)
-            
+
     order_id = str(uuid.uuid4())
     if idem:
         try:
             redis_client.setex(f"idem:{idem}", 3600, order_id)
         except Exception as e:
             print(f"Redis idempotency write error: {e}", flush=True)
-            
+
     return JSONResponse(status_code=201, content={"id": order_id})
 
 @app.get("/orders")
-async def get_orders(limit: int = 10, cursor: str = None):
+async def get_orders(limit: int = 10, cursor: Optional[str] = None):
     all_items = [{"id": i} for i in range(1, config.Q9_TOTAL_ORDERS + 1)]
     start_idx = int(cursor) if cursor and cursor.isdigit() else 0
     end_idx = start_idx + limit
     page = all_items[start_idx:end_idx]
-    
+
     next_cur = str(end_idx) if end_idx < len(all_items) else None
     return {"items": page, "next_cursor": next_cur}
 
-# --- Q10 ---
 @app.get("/ping")
 async def ping(request: Request):
     return {"email": config.EMAIL, "request_id": request.state.req_id}
