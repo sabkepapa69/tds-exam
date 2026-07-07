@@ -59,23 +59,19 @@ def safe_extract_json(s: str) -> dict:
     return {}
 
 def apply_cors(response: Response, path: str, origin: Optional[str]):
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Expose-Headers"] = "*"
     if not origin:
         return
     if path == "/ping":
         if origin == config.Q10_ALLOWED_ORIGIN or config.EXAM_PORTAL_ORIGIN in origin:
             response.headers["Access-Control-Allow-Origin"] = origin
-        else:
-            response.headers["Access-Control-Allow-Origin"] = "*"
     elif path == "/stats":
         if origin == config.Q1_ALLOWED_ORIGIN or config.EXAM_PORTAL_ORIGIN in origin:
             response.headers["Access-Control-Allow-Origin"] = origin
-        else:
-            response.headers["Access-Control-Allow-Origin"] = "*"
     else:
         response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Expose-Headers"] = "*"
 
 @app.middleware("http")
 async def custom_middleware(request: Request, call_next):
