@@ -82,10 +82,9 @@ async def custom_middleware(request: Request, call_next):
     response = None
 
     if path == "/orders":
-        client_id = request.headers.get("X-Client-Id", "default")
-        if "flood" in client_id or client_id == "default":
-            if is_rate_limited(client_id, config.Q9_RATE_LIMIT, "q9"):
-                response = Response(status_code=429, headers={"Retry-After": "10"})
+    client_id = request.headers.get("X-Client-Id", "default")
+    if is_rate_limited(client_id, config.Q9_RATE_LIMIT, "q9"):
+        response = Response(status_code=429, headers={"Retry-After": "10"})
 
     if not response and path == "/ping":
         client_id = request.headers.get("X-Client-Id", "default")
@@ -107,8 +106,8 @@ async def custom_middleware(request: Request, call_next):
 
     if origin:
         if path == "/ping":
-            if origin == config.Q10_ALLOWED_ORIGIN or config.EXAM_PORTAL_ORIGIN in origin:
-                response.headers["Access-Control-Allow-Origin"] = origin
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
         elif path == "/stats":
             if origin == config.Q1_ALLOWED_ORIGIN or config.EXAM_PORTAL_ORIGIN in origin:
                 response.headers["Access-Control-Allow-Origin"] = origin
